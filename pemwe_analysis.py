@@ -167,3 +167,19 @@ def split_and_average(df: pd.DataFrame) -> pd.DataFrame:
     
     return result_df
 
+##### Tafel equations
+
+
+def get_data_for_tafel(current_density, voltage):
+    
+    tafel_region_current = []
+    tafel_region_voltage = []
+
+    for i,x in enumerate(current_density):
+        if (x < 0.2):
+            tafel_region_current.append(x)
+            tafel_region_voltage.append(voltage[i])
+            
+    return tafel_region_current, tafel_region_voltage
+
+
