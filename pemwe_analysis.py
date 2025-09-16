@@ -42,8 +42,14 @@ def get_filenames_csv(directory):
     return filenames
 
 def _convert_abs_time_to_total_seconds(df):
-    df['seconds'] = pd.to_datetime(df['time/s'])
-    df['seconds'] = (df['seconds'] - df['seconds'].min()).dt.total_seconds() + 0.1
+    col = df['time/s']
+
+    # If already numeric, raise error
+    if pd.api.types.is_numeric_dtype(col):
+        return df
+    
+    seconds = pd.to_datetime(col)
+    df['time/s'] = (seconds - seconds.min()).dt.total_seconds() + 0.1
     return df
 
 def _combine_dataframes(dfs_list):
@@ -54,10 +60,54 @@ def _sort_dataframe_by_time(df):
     df_sorted = df.sort_values(by="time/s")
     return df_sorted
 
+def _rename_and_process_voltage_and_current(df, voltage_col=None, current_col=None):
+
+    if voltage_col is None:
+        # Find column with "Ewe" and "V"
+        voltage_cols = [c for c in df.columns if "Ewe" in c and "V" in c]
+        if len(voltage_cols) == 0:
+            raise ValueError("No column found containing both 'Ewe' and 'V'.")
+        if len(voltage_cols) > 1:
+            raise ValueError(f"Multiple voltage columns found: {voltage_cols}")
+        voltage_col = voltage_cols[0]
+        
+    # Rename
+    df = df.rename(columns={voltage_col: "Ewe/V"})
+    
+    if current_col is None:
+        # Find column with "I" and "mA"
+        current_cols = [c for c in df.columns if "I" in c and "mA" in c]
+        if len(current_cols) == 0:
+            raise ValueError("No column found containing both 'I' and 'mA'.")
+        if len(current_cols) > 1:
+            raise ValueError(f"Multiple current columns found: {current_cols}")
+        current_col = current_cols[0]
+    
+    # Convert and rename
+    df = df.rename(columns={current_col: "i/Acm-2"})
+    df["i/Acm-2"] = df["i/Acm-2"] / 5000
+    
+    return df
+
+def _convert_ohms_to_ohms_cm2(df):
+
+    ohm_columns = [c for c in df.columns if "Ohm" in c]
+    for ohm_col in ohm_columns:
+        df = df.rename(columns={ohm_col: ohm_col+'cm2'})
+        df[ohm_col+'cm2'] = df[ohm_col+'cm2']*5
+        # df[ohm_col+'cm2'] = df[ohm_col] * 5
+    
+    # df = df.drop(columns=ohm_columns)
+
+    return df
+
+
 def get_raw_data(filenames):
     dfs_list = []
     for file in filenames:
         df = pd.read_csv(file, sep=r'\t(?!\t$)', engine='python')
+        df = _rename_and_process_voltage_and_current(df)
+        df = _convert_ohms_to_ohms_cm2(df)
         dfs_list.append(df)
     combined_df = _combine_dataframes(dfs_list)
     time_sorted_df = _sort_dataframe_by_time(combined_df)
@@ -68,12 +118,14 @@ def getPolCurve_CP(filenames):
     dfs_list = []
     for file in filenames:
         df = pd.read_csv(file, sep="\t(?!\t$)", engine='python')
+        df = _rename_and_process_voltage_and_current(df)
         df = _average_data_on_Ns(df)
         dfs_list.append(df)
         
     combined_df = _combine_dataframes(dfs_list)
     time_sorted_df = _sort_dataframe_by_time(combined_df)
     df_reset = time_sorted_df.reset_index(drop=True)
+    df_reset = df_reset.drop(columns=['time/s'])
     return df_reset
 
 def getPolCurve_GEIS(filenames):
@@ -82,6 +134,9 @@ def getPolCurve_GEIS(filenames):
         df = pd.read_csv(file, sep="\t(?!\t$)", engine='python')
         Ns_end_value = df.loc[df['freq/Hz'].ne(0).iloc[::-1].idxmax(), 'Ns']
         df = df[df['Ns'] <= Ns_end_value]
+        df = _rename_and_process_voltage_and_current(df)
+        df = _convert_ohms_to_ohms_cm2(df)
+
         #make two dataframes, one of the EIS data to calc HFR and another for current hold data
         df_for_HFR = df[df['freq/Hz']!= 0]
         df_for_IV = df[df['freq/Hz']== 0]
@@ -89,7 +144,7 @@ def getPolCurve_GEIS(filenames):
         HFRs = _get_HFR_array_Ns(df_for_HFR)
         df = _average_data_on_Ns(df_for_IV)
 
-        df['HFR'] = HFRs
+        df['HFR/Ohmcm2'] = HFRs
         dfs_list.append(df)
         
     combined_df = _combine_dataframes(dfs_list)
@@ -97,7 +152,7 @@ def getPolCurve_GEIS(filenames):
     df_reset = time_sorted_df.reset_index(drop=True)
 
     df_add_HFR = _calc_HFR_free(df_reset)
-    df_add_HFR = df_add_HFR.drop(columns=['freq/Hz','Re(Z)/Ohm','-Im(Z)/Ohm', 'time/s','cycle number'],errors='ignore')
+    df_add_HFR = df_add_HFR.drop(columns=['freq/Hz','Re(Z)/Ohmcm2','-Im(Z)/Ohmcm2', 'time/s','cycle number'],errors='ignore')
     return df_add_HFR
 
 def _average_data_on_Ns(pol_curve_raw_data=pd.DataFrame, num_rows_to_average=100):
@@ -114,6 +169,7 @@ def _average_data_on_Ns(pol_curve_raw_data=pd.DataFrame, num_rows_to_average=100
                 pol_curve_averaged_data.loc[cycle_num,original_col_name] = last_rows[original_col_name].mean()
     return pol_curve_averaged_data
 
+
 def _get_HFR_array_Ns(df):
     pol_curve_Ns_grouped = df.groupby("Ns")
     HFR_list_for_given_df = []
@@ -123,8 +179,8 @@ def _get_HFR_array_Ns(df):
     return np.array(HFR_list_for_given_df)
 
 def _calc_HFR(df):
-    real = np.array(df['Re(Z)/Ohm'])
-    im = np.array(df['-Im(Z)/Ohm'])
+    real = np.array(df['Re(Z)/Ohmcm2'])
+    im = np.array(df['-Im(Z)/Ohmcm2'])
     if len(im) < 10:
         HFR = 0
     else:
@@ -136,8 +192,8 @@ def _calc_HFR(df):
     return HFR
 
 def _calc_HFR_free(df):
-    average_HFR = np.average(df['HFR'])
-    df['EiR-Free/V'] = df['<Ewe>/V'] - ((df['<I>/mA']/1000)*average_HFR)
+    average_HFR = np.average(df['HFR/Ohmcm2'])
+    df['Ehfr-free/V'] = df['Ewe/V'] - ((df['i/Acm-2'])*average_HFR)
     return df
 
 def split_and_average(df: pd.DataFrame) -> pd.DataFrame:
@@ -167,19 +223,10 @@ def split_and_average(df: pd.DataFrame) -> pd.DataFrame:
     
     return result_df
 
-##### Tafel equations
+### Tafel equations
 
-
-def get_data_for_tafel(current_density, voltage):
-    
-    tafel_region_current = []
-    tafel_region_voltage = []
-
-    for i,x in enumerate(current_density):
-        if (x < 0.2):
-            tafel_region_current.append(x)
-            tafel_region_voltage.append(voltage[i])
-            
-    return tafel_region_current, tafel_region_voltage
-
-
+def tafel(x,b,i0):
+    y = []
+    for i in x:
+        y.append(b*np.log10(i/(i0))+1.182)
+    return np.array(y)
